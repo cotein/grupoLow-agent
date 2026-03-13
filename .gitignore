@@ -1,0 +1,23 @@
+output.txt
+node_modules
+dist
+.mastra
+.env.development
+.env
+*.db
+*.db-*
+.netlify
+.vercel
+
+# Documents and binaries
+*.pdf
+*.xlsx
+*.xls
+*.csv
+*Image*
+*.zip
+*.tar.gz
+
+# Local/Agent context
+.gemini/
+brain/

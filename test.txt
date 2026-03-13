@@ -1,0 +1,1 @@
+Test Document\nThis is a test document to verify the RAG indexing works properly.
