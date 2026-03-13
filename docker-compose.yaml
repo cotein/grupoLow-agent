@@ -1,5 +1,5 @@
 services:
-  grupoLow-demo:
+  grupolow-demo:
     build: .
     ports:
       - "4113:4111"
