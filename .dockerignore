@@ -1,0 +1,9 @@
+node_modules
+.mastra
+.env
+.git
+.gitignore
+*.md
+Dockerfile
+docker-compose.yaml
+package-lock.json
