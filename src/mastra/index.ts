@@ -5,6 +5,9 @@ import { Observability, DefaultExporter, CloudExporter, SensitiveDataFilter } fr
 import { financialAnalystAgent } from './agents/financial-agent';
 import { registerApiRoute } from '@mastra/core/server';
 
+const DEMO_RESOURCE_ID = "DEMO_USER_FINANCIERO_COTO";
+const DEMO_THREAD_ID = "DEMO_THREAD_ESTRATEGICO_001";
+
 export const mastra = new Mastra({
   workflows: {},
   agents: { financialAnalystAgent },
@@ -42,19 +45,27 @@ export const mastra = new Mastra({
           const mensajeUsuario = body.message || "Hola";
           let threadId = body.threadId;
           const clientId = body.clientId; // Para no duplicar pacientes
-
+          console.log('Body indicators request:', JSON.stringify(body, null, 2));
           // 2. Instanciamos a tu agente
           const mastra = c.get('mastra');
           const agent = mastra.getAgent('financialAnalystAgent');
           const memory = await agent.getMemory();
 
-          // 3. Generamos temporalmente una nueva memoria (hilo) si no se envió en el body
-          if (!threadId && memory) {
-             const thread = await memory.createThread({
-               resourceId: body.resourceId || "financiero",
-               title: "Nueva consulta desde web"
-             });
-             threadId = thread.id;
+          if (memory) {
+            try {
+              // Verificamos si el hilo ya existe en la base de datos
+
+                // Si no existe, lo creamos vinculado a nuestro recurso hardcodeado
+                await memory.createThread({
+                  resourceId: DEMO_RESOURCE_ID,
+                  threadId: DEMO_THREAD_ID,
+                  title: "Hilo Permanente de Demo"
+                });
+                console.log(`✅ Hilo de demo creado: ${DEMO_THREAD_ID}`);
+            } catch (error) {
+              // En demos, si falla el check pero el hilo existe, procedemos
+              console.log("ℹ️ Info: El hilo ya está operativo.");
+            }
           }
 
           // 4. Calculamos la hora de Argentina y el saludo dinámicamente
@@ -74,16 +85,18 @@ export const mastra = new Mastra({
           let instructionDinamica = `La fecha y hora actual en Argentina es ${ahora}. Si este es el primer mensaje de la conversación, es obligatorio que saludes al paciente diciendo exactamente "${momentoDia}"`;
           
           
-
+          console.log('Body indicators request:', JSON.stringify(mensajeUsuario, null, 2));
           // 6. Generamos la respuesta con IA inyectándole el contexto por debajo
           const response = await agent.generate(mensajeUsuario, {
              memory: {
                  thread: threadId,
                  resource: body.resourceId || "financiero"
              },
-             system: instructionDinamica
+             toolChoice: 'auto',
+             instructions: instructionDinamica
           });
 
+          
           // 7. Devolvemos el texto final Y TAMBIÉN el identificador del hilo actual, 
           // el frontend debe encargarse de conservar ese 'threadId' y enviarlo en el próximo POST!
           return c.json({
@@ -96,6 +109,7 @@ export const mastra = new Mastra({
         method: 'POST',
         handler: async c => {
           const body = await c.req.json();
+          console.log('Body indicators request:', JSON.stringify(body, null, 2));
           const mastra = c.get('mastra');
           const tool = mastra.getTool('consultarIndicadores');
 

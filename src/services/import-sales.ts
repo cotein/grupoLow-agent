@@ -1,6 +1,8 @@
-import ExcelJS from 'exceljs';
-import pkg from 'pg';
-const { Pool } = pkg;
+import * as ExcelJS_ from 'exceljs';
+const ExcelJS = (ExcelJS_ as any).default || ExcelJS_;
+
+import * as pg from 'pg';
+const { Pool } = pg;
 import 'dotenv/config';
 
 // Configuration
@@ -27,12 +29,22 @@ async function importSales() {
         const workbook = new ExcelJS.Workbook();
         await workbook.xlsx.readFile(CONFIG.filePath);
         const worksheet = workbook.getWorksheet(1);
+        if (!worksheet) {
+            throw new Error('❌ No se encontró la primera hoja del Excel.');
+        }
         
+        // Log Headers
+        const headerRow = worksheet.getRow(1);
+        console.log('📋 Excel Headers detected:', headerRow.values);
+
         const totalRows = worksheet.rowCount - 1; // Excluding headers
         console.log(`📊 Total rows to process: ${totalRows}`);
 
         let batch: any[] = [];
         let importedCount = 0;
+        let totalInserted = 0;
+        let totalConflicts = 0;
+        let totalSkippedMissingId = 0;
 
         // Start from row 2 (headers are row 1)
         for (let i = 2; i <= worksheet.rowCount; i++) {
@@ -43,7 +55,7 @@ async function importSales() {
             const data = {
                 cliente: values[1],
                 direccion: values[2],
-                fecha: values[3] instanceof Date ? values[3] : new Date(values[3]),
+                fecha: toLocalDate(values[3]),
                 comprobante: values[4],
                 art: values[5],
                 cantidad: parseFloat(values[6]) || 0,
@@ -75,27 +87,36 @@ async function importSales() {
                 tipov: values[32],
                 segmentoproducto: values[33],
                 linea: values[34],
-                fecha_pedido: values[35] instanceof Date ? values[35] : new Date(values[35])
+                fecha_pedido: toLocalDate(values[35]),  
             };
 
             if (data.idunica) {
                 batch.push(data);
             } else {
-                console.log(`⚠️ Skiped row ${i}: Missing idunica (Comprobante: ${data.comprobante}, Artículo: ${data.articulo})`);
+                totalSkippedMissingId++;
+                console.log(`⚠️ Skipped row ${i}: Missing idunica (Comprobante: ${data.comprobante}, Artículo: ${data.articulo})`);
             }
 
             if (batch.length >= CONFIG.batchSize || i === worksheet.rowCount) {
                 if (batch.length > 0) {
-                    await upsertBatch(pool, batch);
+                    const results = await upsertBatch(pool, batch);
+                    totalInserted += results.inserted;
+                    totalConflicts += results.conflicts;
                     importedCount += batch.length;
-                    console.log(`✅ Progress: ${importedCount}/${totalRows} rows upserted.`);
+                    console.log(`✅ Progress: ${importedCount}/${totalRows} rows processed. (Batch: ${results.inserted} new, ${results.conflicts} existing)`);
                     batch = [];
                 }
             }
         }
 
         console.log('\n✨ Import finished successfully!');
-        console.log(`Total rows imported/updated: ${importedCount}`);
+        console.log('-------------------------------------------');
+        console.log(`📊 TOTAL SUMMARY:`);
+        console.log(`✅ Total Inserted (New): ${totalInserted}`);
+        console.log(`🔁 Total Existing (Conflicts/Skipped): ${totalConflicts}`);
+        console.log(`⚠️ Total Missing idunica (Skipped): ${totalSkippedMissingId}`);
+        console.log(`📈 Grand Total Processed: ${importedCount + totalSkippedMissingId}`);
+        console.log('-------------------------------------------');
 
     } catch (error) {
         console.error('❌ Error during import:', error);
@@ -104,8 +125,11 @@ async function importSales() {
     }
 }
 
-async function upsertBatch(pool: pkg.Pool, batch: any[]) {
+async function upsertBatch(pool: pg.Pool, batch: any[]) {
     const client = await pool.connect();
+    let inserted = 0;
+    let conflicts = 0;
+
     try {
         for (const record of batch) {
             const query = `
@@ -116,7 +140,8 @@ async function upsertBatch(pool: pkg.Pool, batch: any[]) {
                     facturacion, cmv, d1, d2, peso, rubro, descripcion, capacidad_art, 
                     usuariopicking, nombrepicking, tipov, segmentoproducto, linea, fecha_pedido
                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35)
-                ON CONFLICT (comprobante, articulo) DO NOTHING;
+                ON CONFLICT (comprobante, articulo) DO NOTHING
+                RETURNING 1;
             `;
             
             const values = [
@@ -131,17 +156,33 @@ async function upsertBatch(pool: pkg.Pool, batch: any[]) {
             ];
             
             try {
-                await client.query(query, values);
+                const res = await client.query(query, values);
+                if (res.rowCount && res.rowCount > 0) {
+                    inserted++;
+                } else {
+                    conflicts++;
+                }
             } catch (err: any) {
                 console.error(`⚠️ Fila omitida. No se pudo insertar (Comprobante: ${record.comprobante}, Artículo: ${record.articulo}). Razón: ${err.message}`);
             }
         }
+        return { inserted, conflicts };
     } catch (e: any) {
         console.error('❌ Error de conexión en el lote:', e.message);
         throw e;
     } finally {
         client.release();
     }
+}
+
+// Función helper para corregir el desfase
+function toLocalDate(value: any): string | null {
+    if (!value) return null;
+    const d = value instanceof Date ? value : new Date(value);
+    const year = d.getUTCFullYear();
+    const month = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const day = String(d.getUTCDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`; // "2026-02-02"
 }
 
 importSales();

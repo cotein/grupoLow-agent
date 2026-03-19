@@ -6,6 +6,9 @@ import { instructions } from '../prompts/financial-prompt';
 import { Memory } from "@mastra/memory";
 import { PostgresStore } from '@mastra/pg';
 import { z } from 'zod';
+import { getHealthMetrics, getCustomerAnalytics, getProfitabilityAnalysis, getSalesOpportunities } from '../tools/financial-tools';
+
+
 // 1. Create the vector query tool to search the PDF embeddings
 export const pdfVectorQueryTool = createVectorQueryTool({
   vectorStoreName: 'pgVector',
@@ -53,7 +56,6 @@ const agentMemory = new Memory({
   tools: { pdfVectorQueryTool },
 });*/
 
-import { getHealthMetrics, getRFMAnalysis, getBreakevenPoint, getAdditionalKPIs, getSalesAggregations, consultarIndicadores } from '../tools/financial-tools';
 
 // 3. Agente Especialista en Finanzas y Ventas
 export const financialAnalystAgent = new Agent({
@@ -61,9 +63,28 @@ export const financialAnalystAgent = new Agent({
   name: 'Analista Comercial y Financiero',
   model: 'openai/gpt-4o',
   tools: { 
-    consultarIndicadores
+    getHealthMetrics,
+    getCustomerAnalytics,
+    getProfitabilityAnalysis,
+    pdfVectorQueryTool,
+    getSalesOpportunities
   },
-  memory: agentMemory,
+  memory: new Memory({
+    storage: new PostgresStore({
+    id: 'memoria-financiera',
+    connectionString: process.env.DATABASE_URL, 
+  }),
+    options: {
+      lastMessages: 15,
+      workingMemory: {
+        enabled: true,
+        schema: z.object({
+            targetRentabilidad: z.string().optional(),
+            marcasFoco: z.array(z.string()).optional()
+        })
+      }
+    }
+  }),
   instructions: `
   ${instructions}
 

@@ -1,522 +1,336 @@
 import { createTool } from '@mastra/core/tools';
 import { z } from 'zod';
 import { Pool } from 'pg';
-
 import 'dotenv/config';
 
-// Use a single connection pool for the tools
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
 });
 
+const COLUMN_MAPPER: Record<string, string> = {
+    vendedor: 'cod_ven',
+    cliente: 'razon_social',
+    articulo: 'articulo',
+    rubro: 'rubro',
+    subcanal: 'subcanal',
+    linea: 'linea',
+    chofer: 'chofer',
+    segmento: 'segmentoproducto',
+    fecha: 'DATE(fecha)',
+};
+
+/**
+ * HELPER: Gestión de filtros de fecha para reutilización
+ */
+const getFechaFilters = (startDate?: string, endDate?: string, paramOffset = 0) => {
+    const params: any[] = [];
+    let querySnippet = '';
+    if (startDate) {
+        params.push(startDate);
+        querySnippet += ` AND fecha >= $${params.length + paramOffset}`;
+    }
+    if (endDate) {
+        params.push(endDate);
+        querySnippet += ` AND fecha <= $${params.length + paramOffset}`;
+    }
+    return { params, querySnippet };
+};
+
+/**
+ * TOOL 1: Salud Financiera Global
+ * Optimizado: Solo métricas core.
+ */
 export const getHealthMetrics = createTool({
     id: 'getHealthMetrics',
-    description: 'Calcula indicadores de salud financiera: Ingresos Totales (Ventas Netas), CMV (Costo de Mercadería Vendida), Utilidad Bruta, y Margen Bruto %. Excluye muestras gratis (descuento 100%).',
+    description: 'Calcula ingresos, CMV, utilidad y margen bruto global. Excluye muestras gratis.',
     inputSchema: z.object({
-        startDate: z.string().describe('Fecha de inicio en formato YYYY-MM-DD. Opcional.').optional(),
-        endDate: z.string().describe('Fecha de fin en formato YYYY-MM-DD. Opcional.').optional(),
+        startDate: z.string()
+    .describe("Fecha de inicio del análisis en formato ISO (YYYY-MM-DD). Ejemplo: '2024-01-01'"),
+    
+  endDate: z.string()
+    .describe("Fecha de fin del análisis en formato ISO (YYYY-MM-DD). Debe ser igual o posterior a startDate"),
     }),
-    execute: async (data: any) => {
-        let query = `
-            SELECT 
-                SUM(importe) as ingresos_totales,
-                SUM(cantidad * pr_costo_uni_neto) as cmv_total,
-                SUM(importe) - SUM(cantidad * pr_costo_uni_neto) as utilidad_bruta,
-                ((SUM(importe) - SUM(cantidad * pr_costo_uni_neto)) / NULLIF(SUM(importe), 0)) * 100 as margen_bruto_porcentaje
-            FROM ventas_detalle
-            WHERE descuento < 100  -- Excluir muestras gratis
-        `;
-        const params: any[] = [];
-        if (data.startDate) {
-            params.push(data.startDate);
-            query += ` AND fecha >= $${params.length}`;
-        }
-        if (data.endDate) {
-            params.push(data.endDate);
-            query += ` AND fecha <= $${params.length}`;
-        }
-        
-        try {
-            const res = await pool.query(query, params);
-            return res.rows[0];
-        } catch (error) {
-            console.error(error);
-            return { error: 'Error ejecutando la consulta SQL de health metrics' };
-        }
-    }
-});
-
-export const getRFMAnalysis = createTool({
-    id: 'getRFMAnalysis',
-    description: 'Genera un análisis RFM (Recency, Frequency, Monetary) de los clientes para segmentar la base de datos basándose en comportamiento real.',
-    inputSchema: z.object({
-        limit: z.number().describe('Límitar la cantidad de clientes devueltos. Por defecto 50.').optional(),
-    }),
-    execute: async (data: any) => {
+    execute: async ({ startDate, endDate }) => {
+        const { params, querySnippet } = getFechaFilters(startDate, endDate);
         const query = `
             SELECT 
-                cliente as cliente_id,
-                MAX(razon_social) as cliente_nombre,
-                EXTRACT(DAY FROM (CURRENT_DATE - MAX(fecha))) as recencia_dias,
-                COUNT(DISTINCT idunica) as frecuencia_compras,
-                SUM(importe) as valor_monetario
-            FROM ventas_detalle
-            WHERE cliente IS NOT NULL AND importe > 0
-            GROUP BY cliente
-            ORDER BY valor_monetario DESC
-            LIMIT $1
+    -- Ventas Totales (Lo que entró)
+    SUM(importe) as ingresos_brutos,
+    
+    -- El impacto real de los descuentos (¿Cuánto dinero dejamos de ganar?)
+    SUM(importe / (1 - (descuento/100)) * (descuento/100)) as monto_descuentos,
+    
+    -- Costo de Ventas
+    SUM(cantidad * pr_costo_uni_neto) as cmv_comercial,
+    
+    -- Utilidad y Margen
+    SUM(importe) - SUM(cantidad * pr_costo_uni_neto) as utilidad_bruta,
+    
+    ROUND(((SUM(importe) - SUM(cantidad * pr_costo_uni_neto)) / NULLIF(SUM(importe), 0) * 100)::numeric, 2) as margen_bruto_pct,
+
+    -- Análisis de "Regalos" (Lo que filtraste antes, ahora dáselo como dato)
+    (SELECT SUM(cantidad * pr_costo_uni_neto) FROM ventas_detalle WHERE descuento >= 100) as costo_inversion_marketing
+
+FROM ventas_detalle
+WHERE importe > 0 
+  ${querySnippet}
         `;
-        const limit = data.limit || 50;
-        
-        try {
-            const res = await pool.query(query, [limit]);
-            return res.rows;
-        } catch (error) {
-            console.error(error);
-            return { error: 'Error ejecutando análisis RFM' };
+
+        // AGREGAR ESTO PARA DEBUG:
+        console.log("--- AGENT QUERY START ---");
+        console.log("SQL:", query);
+        console.log("PARAMS:", params);
+        console.log("--- AGENT QUERY END ---");
+        const res = await pool.query(query, params);
+        if (!res.rows[0]) {
+            return { message: "No se encontraron movimientos para los filtros aplicados (Línea/Fecha)." };
         }
+        console.log("--- AGENT RESPONSE START ---");
+        console.log(res.rows[0]);
+        console.log("--- AGENT RESPONSE END ---");
+        return res.rows[0];
     }
 });
 
-export const getBreakevenPoint = createTool({
-    id: 'getBreakevenPoint',
-    description: 'Calcula el Punto de Equilibrio en Pesos. Indica cuánto se debe vender para que la utilidad operativa sea cero. Requiere proveer los costos fijos.',
+/**
+ * TOOL 2: Análisis de Clientes (RFM & Segmentación)
+ * Separado para reducir carga cognitiva.
+ */
+export const getCustomerAnalytics = createTool({
+    id: 'getCustomerAnalytics',
+    description: 'Análisis de comportamiento de clientes: RFM, Clientes Dormidos o Campeones.',
     inputSchema: z.object({
-        costosFijos: z.number().describe('El valor monetario de los costos fijos (ej. sueldos, alquileres).'),
-        startDate: z.string().describe('Fecha inicio YYYY-MM-DD. Opcional.').optional(),
-        endDate: z.string().describe('Fecha fin YYYY-MM-DD. Opcional.').optional(),
+        type: z.enum(['rfm', 'dormidos', 'campeones']),
+        limit: z.number().default(10),
+        diasSinCompra: z.number().optional().describe('Para tipo "dormidos". Default 60.')
     }),
-    execute: async (data: any) => {
-        let query = `
-            SELECT 
-                SUM(importe) as ventas_totales,
-                SUM(cantidad * pr_costo_uni_neto) as cmv_total
-            FROM ventas_detalle
-            WHERE descuento < 100
-        `;
-        const params: any[] = [];
-        if (data.startDate) {
-            params.push(data.startDate);
-            query += ` AND fecha >= $${params.length}`;
-        }
-        if (data.endDate) {
-            params.push(data.endDate);
-            query += ` AND fecha <= $${params.length}`;
-        }
+    execute: async ({ type, limit, diasSinCompra = 60 }) => {
+        let query = '';
+        const params: any[] = [limit];
 
-        try {
-            const res = await pool.query(query, params);
-            if (res.rows.length === 0) return { error: 'Sin datos en ese periodo' };
-            
-            const ventas = parseFloat(res.rows[0].ventas_totales) || 0;
-            const cmv = parseFloat(res.rows[0].cmv_total) || 0;
-            
-            if (ventas === 0) return { error: 'Las ventas totales son cero, no se puede calcular' };
-            
-            const puntoEquilibrio = data.costosFijos / (1 - (cmv / ventas));
-            
-            return {
-                punto_equilibrio_pesos: puntoEquilibrio,
-                costos_fijos_ingresados: data.costosFijos,
-                ventas_periodo: ventas,
-                cmv_periodo: cmv
-            };
-        } catch (error) {
-            console.error(error);
-            return { error: 'Error calculando Punto de Equilibrio' };
+        if (type === 'rfm') {
+            query = `
+                SELECT cliente as id, MAX(razon_social) as nombre,
+                EXTRACT(DAY FROM (CURRENT_DATE - MAX(fecha))) as recencia,
+                COUNT(DISTINCT idunica) as frecuencia, SUM(importe) as monetario
+                FROM ventas_detalle WHERE importe > 0 GROUP BY cliente
+                ORDER BY monetario DESC LIMIT $1`;
+
+            // AGREGAR ESTO PARA DEBUG:
+            console.log("--- AGENT QUERY START ---");
+            console.log("SQL:", query);
+            console.log("PARAMS:", params);
+            console.log("--- AGENT QUERY END ---");
+        } else if (type === 'dormidos') {
+            params.push(diasSinCompra);
+            query = `
+                SELECT cliente, razon_social, MAX(fecha) as ultima_vta
+                FROM ventas_detalle GROUP BY cliente, razon_social
+                HAVING MAX(fecha) < CURRENT_DATE - $2
+                ORDER BY ultima_vta DESC LIMIT $1`;
+
+            // AGREGAR ESTO PARA DEBUG:
+            console.log("--- AGENT QUERY START ---");
+            console.log("SQL:", query);
+            console.log("PARAMS:", params);
+            console.log("--- AGENT QUERY END ---");
+        } else {
+            query = `SELECT cliente, razon_social, SUM(importe) as total FROM ventas_detalle 
+                     GROUP BY cliente, razon_social ORDER BY total DESC LIMIT $1`;
+
+            // AGREGAR ESTO PARA DEBUG:
+            console.log("--- AGENT QUERY START ---");
+            console.log("SQL:", query);
+            console.log("PARAMS:", params);
+            console.log("--- AGENT QUERY END ---");
         }
+        
+        const res = await pool.query(query, params);
+        if (res.rows.length === 0) {
+            return { message: "No se encontraron movimientos para los filtros aplicados (Línea/Fecha)." };
+        }
+        console.log("--- AGENT RESPONSE START ---");
+        console.log(res.rows);
+        console.log("--- AGENT RESPONSE END ---");
+        return res.rows;
     }
 });
 
-export const getAdditionalKPIs = createTool({
-    id: 'getAdditionalKPIs',
-    description: 'Calcula KPIs estratégicos: Ticket Promedio, Índice de Devoluciones (% de la venta que se cae) y Riesgo de Concentración Pareto (% de margen del top 20% de clientes).',
+/**
+ * TOOL 3: Análisis de Rentabilidad Detallado
+ * Aquí manejamos la lógica compleja de "Real vs Comercial"
+ */
+export const getProfitabilityAnalysis = createTool({
+    id: 'getProfitabilityAnalysis',
+    description: 'Analiza rentabilidad real vs comercial discriminando muestras gratis y descuentos.',
     inputSchema: z.object({
-        startDate: z.string().optional(),
-        endDate: z.string().optional()
+        groupBy: z.enum(['vendedor', 'articulo', 'linea', 'subcanal', 'fecha']),
+        startDate: z.string()
+    .describe("Fecha de inicio del análisis en formato ISO (YYYY-MM-DD). Ejemplo: '2024-01-01'"),
+    
+  endDate: z.string()
+    .describe("Fecha de fin del análisis en formato ISO (YYYY-MM-DD). Debe ser igual o posterior a startDate"),
+        limit: z.number().default(20)
     }),
-    execute: async (data: any) => {
-        const params: any[] = [];
-        let dateFilter = '';
-        if (data.startDate) {
-            params.push(data.startDate);
-            dateFilter += ` AND fecha >= $${params.length}`;
-        }
-        if (data.endDate) {
-            params.push(data.endDate);
-            dateFilter += ` AND fecha <= $${params.length}`;
-        }
-
-        const ticketQuery = `
-            SELECT SUM(importe) / COUNT(DISTINCT idunica) as ticket_promedio 
-            FROM ventas_detalle 
-            WHERE importe > 0 ${dateFilter}
-        `;
-        
-        const devQuery = `
-            SELECT 
-                ABS(SUM(CASE WHEN importe < 0 THEN importe ELSE 0 END)) / NULLIF(SUM(CASE WHEN importe > 0 THEN importe ELSE 0 END), 0) * 100 as indice_devoluciones_pct
-            FROM ventas_detalle
-            WHERE 1=1 ${dateFilter}
-        `;
-
-        const paretoQuery = `
-            WITH VentasClientes AS (
-                SELECT cliente, SUM(importe - (cantidad * pr_costo_uni_neto)) as margen
-                FROM ventas_detalle
-                WHERE cliente IS NOT NULL ${dateFilter}
-                GROUP BY cliente
-            ),
-            Totales AS (
-                SELECT SUM(margen) as margen_total, COUNT(*) as clientes_totales FROM VentasClientes WHERE margen > 0
-            ),
-            TopClientes AS (
-                SELECT margen
-                FROM VentasClientes
-                WHERE margen > 0
-                ORDER BY margen DESC
-                LIMIT GREATEST(1, (SELECT clientes_totales FROM Totales) * 0.20)
-            )
-            SELECT (SUM(t.margen) / NULLIF((SELECT margen_total FROM Totales), 0)) * 100 as concentracion_pareto_20_pct
-            FROM TopClientes t
-        `;
-
-        try {
-            const [ticketRes, devRes, paretoRes] = await Promise.all([
-                pool.query(ticketQuery, params),
-                pool.query(devQuery, params),
-                pool.query(paretoQuery, params)
-            ]);
-
-            return {
-                ticket_promedio: ticketRes.rows[0]?.ticket_promedio,
-                indice_devoluciones_pct: devRes.rows[0]?.indice_devoluciones_pct,
-                concentracion_pareto_20_pct: paretoRes.rows[0]?.concentracion_pareto_20_pct
-            };
-        } catch (error) {
-            console.error(error);
-            return { error: 'Error calculando KPIs adicionales' };
-        }
-    }
-});
-
-export const getSalesAggregations = createTool({
-    id: 'getSalesAggregations',
-    description: 'Agrupa las ventas, márgenes y rentabilidad por una dimensión específica (ej. vendedor, rubro, articulo, cliente, proveedor/descripcion, etc).',
-    inputSchema: z.object({
-        groupBy: z.enum(['cod_ven', 'rubro', 'articulo', 'cliente', 'descripcion', 'subcanal', 'segmentoproducto', 'linea']).describe('La dimensión por la cual agrupar los datos.'),
-        limit: z.number().describe('La cantidad máxima de resultados a retornar. Por defecto 20.').optional(),
-        startDate: z.string().describe('Fecha inicio YYYY-MM-DD. Opcional.').optional(),
-        endDate: z.string().describe('Fecha fin YYYY-MM-DD. Opcional.').optional(),
-        orderBy: z.enum(['ventas', 'margen', 'cantidad']).describe('Por qué métrica ordenar. Por defecto "ventas".').optional()
-    }),
-    execute: async (data: any) => {
-        const params: any[] = [];
-        let dateFilter = '';
-        
-        if (data.startDate) {
-            params.push(data.startDate);
-            dateFilter += ` AND fecha >= $${params.length}`;
-        }
-        if (data.endDate) {
-            params.push(data.endDate);
-            dateFilter += ` AND fecha <= $${params.length}`;
-        }
-
-        const groupByCol = data.groupBy;
-        let orderByClause = 'ventas_totales_brutas DESC';
-        if (data.orderBy === 'margen') orderByClause = 'margen_total DESC';
-        if (data.orderBy === 'cantidad') orderByClause = 'cantidad_total DESC';
-
-        const limit = data.limit || 20;
+    execute: async ({ groupBy, startDate, endDate, limit }) => {
+        const col = COLUMN_MAPPER[groupBy];
+        const { params, querySnippet } = getFechaFilters(startDate, endDate);
         params.push(limit);
 
         const query = `
             SELECT 
-                ${groupByCol} as categoria,
-                COUNT(DISTINCT cliente) as clientes_compradores,
-                SUM(cantidad) as cantidad_total,
-                SUM(importe) as ventas_totales_brutas,
-                SUM(importe) as importe_neta,
-                SUM(d1) as total_descuentos_pesos,
-                (SUM(d1) / NULLIF(SUM(importe), 0)) * 100 as porcentaje_descuentos_sobre_ventas,
-                SUM(importe) - SUM(cantidad * pr_costo_uni_neto) as margen_total,
-                ((SUM(importe) - SUM(cantidad * pr_costo_uni_neto)) / NULLIF(SUM(importe), 0)) * 100 as margen_porcentaje
+                ${col} as dimension,
+                
+                -- 1. Ventas Brutas
+                SUM(facturacion) FILTER (WHERE importe > 0) as ventas_brutas,
+                
+                -- 2. Deducciones
+                SUM(d1) as descuentos_totales,
+                
+                -- 3. Ventas Netas
+                SUM(facturacion) FILTER (WHERE importe > 0) - SUM(d1) as ventas_netas,
+                
+                -- 4. Costo de Ventas (CMV de ventas comerciales)
+                SUM(cmv) FILTER (WHERE importe > 0) as costo_de_ventas,
+                
+                -- 5. Utilidad Bruta (Ventas Netas - Costo de Ventas)
+                SUM(facturacion) FILTER (WHERE importe > 0) - SUM(d1) - SUM(cmv) FILTER (WHERE importe > 0) as utilidad_bruta,
+                
+                -- 6. Otros Costos (Muestras, etc)
+                SUM(cmv) FILTER (WHERE importe = 0) as costo_muestras,
+                
+                -- 7. RENTABILIDAD REAL (Utilidad Bruta - Otros Costos)
+                (SUM(facturacion) FILTER (WHERE importe > 0) - SUM(d1) - SUM(cmv) FILTER (WHERE importe > 0) - SUM(cmv) FILTER (WHERE importe = 0)) as rentabilidad_real_neta,
+                
+                -- 8. Márgenes
+                ROUND(((SUM(facturacion) FILTER (WHERE importe > 0) - SUM(d1) - SUM(cmv) FILTER (WHERE importe > 0)) / 
+                       NULLIF(SUM(facturacion) FILTER (WHERE importe > 0) - SUM(d1), 0) * 100)::numeric, 2) as margen_bruto_pct,
+                
+                ROUND(((SUM(facturacion) FILTER (WHERE importe > 0) - SUM(d1) - SUM(cmv) FILTER (WHERE importe > 0) - SUM(cmv) FILTER (WHERE importe = 0)) / 
+                       NULLIF(SUM(facturacion) FILTER (WHERE importe > 0) - SUM(d1), 0) * 100)::numeric, 2) as margen_real_pct
+
             FROM ventas_detalle
-            WHERE ${groupByCol} IS NOT NULL ${dateFilter}
-            GROUP BY ${groupByCol}
-            ORDER BY ${orderByClause}
+            WHERE ${col} IS NOT NULL ${querySnippet}
+            GROUP BY ${col}
+            ORDER BY rentabilidad_real_neta DESC
             LIMIT $${params.length}
         `;
 
+
+        // AGREGAR ESTO PARA DEBUG:
+        console.log("--- AGENT QUERY START ---");
+        console.log("SQL:", query);
+        console.log("PARAMS:", params);
+        console.log("--- AGENT QUERY END ---");
+        const res = await pool.query(query, params);
+        if (res.rows.length === 0) {
+            return { message: "No se encontraron movimientos para los filtros aplicados (Línea/Fecha)." };
+        }
+        console.log("--- AGENT RESPONSE START ---");
+        console.log(res.rows);
+        console.log("--- AGENT RESPONSE END ---");
+        return res.rows;
+    }
+});
+
+// Importamos tus utilidades existentes para mantener la consistencia
+// import { pool, COLUMN_MAPPER, getFechaFilters } from '../lib/db'; 
+
+export const getSalesOpportunities = createTool({
+    id: 'getSalesOpportunities',
+    description: 'Identifica oportunidades de venta analizando qué líneas de productos NO están comprando los clientes top en un periodo dado.',
+    inputSchema: z.object({
+        groupBy: z.enum(['vendedor', 'cliente', 'linea', 'subcanal', 'fecha']).default('cliente'),
+        startDate: z.string()
+    .describe("Fecha de inicio del análisis en formato ISO (YYYY-MM-DD). Ejemplo: '2024-01-01'"),
+    
+  endDate: z.string()
+    .describe("Fecha de fin del análisis en formato ISO (YYYY-MM-DD). Debe ser igual o posterior a startDate"),
+        limitTop: z.number().default(50).describe('Cantidad de clientes más grandes a auditar'),
+        recentMonths: z.number().default(4).describe('Meses hacia atrás para verificar si hubo ventas reales')
+    }),
+    execute: async ({ groupBy, startDate, endDate, limitTop, recentMonths }) => {
+        // 1. Mapeo de columnas y filtros de fecha siguiendo tu patrón
+        const col = COLUMN_MAPPER[groupBy] || 'razon_social';
+        const { params, querySnippet } = getFechaFilters(startDate, endDate);
+        
+        // Añadimos parámetros adicionales para el LIMIT y el intervalo de ventas recientes
+        params.push(limitTop);
+        const limitParamIndex = params.length;
+        
+        params.push(`${recentMonths} months`);
+        const intervalParamIndex = params.length;
+
+        /**
+         * SQL EXPLAINED:
+         * - ClientesTop: Filtra el universo de clientes grandes según facturación en el rango de fechas.
+         * - LineasDisponibles: Obtiene el catálogo activo de líneas.
+         * - MatrizIdeal: Cross Join para crear la expectativa de "Todo cliente debe comprar toda línea".
+         * - VentasReales: Cruza con la realidad de los últimos N meses.
+         */
+        const query = `
+            WITH ClientesTop AS (
+                SELECT 
+                    cliente, 
+                    ${col} as dimension_nombre,
+                    SUM(facturacion) as total_comprado
+                FROM public.ventas_detalle
+                WHERE ${col} IS NOT NULL ${querySnippet}
+                GROUP BY cliente, ${col}
+                ORDER BY total_comprado DESC
+                LIMIT $${limitParamIndex}
+            ),
+            LineasDisponibles AS (
+                SELECT DISTINCT linea 
+                FROM public.ventas_detalle 
+                WHERE linea IS NOT NULL AND linea != ''
+            ),
+            MatrizIdeal AS (
+                SELECT c.cliente, c.dimension_nombre, l.linea
+                FROM ClientesTop c
+                CROSS JOIN LineasDisponibles l
+            ),
+            VentasReales AS (
+                SELECT DISTINCT cliente, linea
+                FROM public.ventas_detalle
+                WHERE 1=1 ${querySnippet ? querySnippet : `AND fecha >= CURRENT_DATE - CAST($${intervalParamIndex} AS INTERVAL)`}
+            )
+            SELECT 
+                m.dimension_nombre as entidad,
+                m.linea as marca_ausente,
+                'Oportunidad de Venta' as accion_sugerida,
+                (CASE WHEN ${startDate ? 'true' : 'false'} OR ${endDate ? 'true' : 'false'} 
+                      THEN 'Sin compras entre ${startDate || '(inicio)'} y ${endDate || '(fin)'}'
+                      ELSE 'Sin compras entre ${startDate || '(inicio)'} y ${endDate || '(fin)'}' 
+                 END) as observacion
+            FROM MatrizIdeal m
+            LEFT JOIN VentasReales v ON m.cliente = v.cliente AND m.linea = v.linea
+            WHERE v.linea IS NULL
+            ORDER BY m.dimension_nombre ASC, m.linea ASC;
+        `;
+
+        // DEBUG siguiendo tu estándar
+        console.log("--- AGENT OPPORTUNITY QUERY START ---");
+        console.log("SQL:", query);
+        console.log("PARAMS:", params);
+        console.log("--- AGENT OPPORTUNITY QUERY END ---");
+
         try {
             const res = await pool.query(query, params);
+
+            if (res.rows.length === 0) {
+                return { message: "No se detectaron brechas de venta. Todos los clientes top están comprando todas las líneas." };
+            }
+
+            console.log("--- AGENT RESPONSE START ---");
+            console.log(`Detectadas ${res.rows.length} oportunidades.`);
+            console.log("--- AGENT RESPONSE END ---");
+
             return res.rows;
         } catch (error) {
-            console.error(error);
-            return { error: 'Error calculando agregaciones de ventas' };
+            console.error("ERROR EN getSalesOpportunities:", error);
+            throw new Error("Error al ejecutar el análisis de oportunidades de venta.");
         }
     }
 });
-
-export const consultarIndicadores = createTool({
-    id: 'consultarIndicadores',
-    description: 'Consulta indicadores puntuales financieros y comerciales en la base de datos.',
-    inputSchema: z.object({
-        indicador: z.enum([
-            'rentabilidad_vendedor',
-            'clientes_no_rentables',
-            'clientes_dto_arriba_stnd',
-            'clientes_no_compran_marca',
-            'productos_no_rentables',
-            'aumentar_margen_sin_caida_ventas',
-            'clientes_campeones',
-            'potencial_venta_zonas',
-            'venta_total',
-            'venta_por_vendedor',
-            'venta_por_categoria',
-            'clientes_compradores',
-            'venta_marcas_foco',
-            'rechazos_devoluciones',
-            'inversion_dtos',
-            'pct_venta_sin_dto',
-            'margen_por_articulo',
-            'margen_total',
-            'ganancia_por_categoria',
-            'margen_descuentos_por_proveedor',
-            'rentabilidad_volumen_subcanal',
-            'ticket_promedio_subcanal',
-            'ticket_promedio_cliente',
-            'producto_mas_vendido',
-            'evolucion_precio_promedio',
-            'indice_concentracion_pareto',
-            'cumplimiento_mix_ideal',
-            'evolucion_diaria_ventas',
-            'evolucion_mensual_ventas'
-        ]).describe('El identificador exacto del indicador a consultar.'),
-        marca: z.string().optional().describe('Marca específica para consultar "clientes_no_compran_marca"'),
-        marcasFoco: z.union([z.string(), z.array(z.string())])
-            .optional()
-            .transform(val => {
-                if (typeof val === 'string') {
-                    return val.trim() === '' ? [] : val.split(',').map(s => s.trim());
-                }
-                return val;
-            })
-            .describe('Lista de marcas para consultar "venta_marcas_foco" (puede ser un array o string separado por comas)'),
-        fechaInicio: z.string().optional().describe('Fecha de inicio en formato YYYY-MM-DD'),
-        fechaFin: z.string().optional().describe('Fecha de fin en formato YYYY-MM-DD'),
-        limite: z.number().max(50).default(10).describe('Cantidad de registros a devolver, máximo 50. Úsalo para pedir el top X.'),
-        orden: z.enum(['DESC', 'ASC']).default('DESC').describe('DESC para traer los de mayor margen (mejores), ASC para los de menor margen (peores).')
-    }),
-    execute: async (inputData: any) => {
-        let sql = '';
-        const params: any[] = [];
-        const limite = inputData.limite ?? 10;
-        const orden = inputData.orden === 'ASC' ? 'ASC' : 'DESC';
-
-        // --- LÓGICA DE FECHAS ---
-        let filtroFecha = '';
-        if (inputData.fechaInicio && inputData.fechaFin) {
-            filtroFecha = `fecha BETWEEN $${params.length + 1} AND $${params.length + 2}`;
-            params.push(inputData.fechaInicio, inputData.fechaFin);
-        } else if (inputData.fechaInicio) {
-            filtroFecha = `fecha >= $${params.length + 1}`;
-            params.push(inputData.fechaInicio);
-        }
-        // ------------------------
-
-        switch (inputData.indicador) {
-            case 'rentabilidad_vendedor':
-                sql = `SELECT cod_ven, SUM(importe - CMV) AS rentabilidad_bruta, (SUM(importe - CMV) / NULLIF(SUM(importe), 0)) * 100 AS margen_porcentual FROM ventas_detalle ${filtroFecha ? 'WHERE ' + filtroFecha : ''} GROUP BY cod_ven ORDER BY rentabilidad_bruta ${orden} LIMIT ${limite};`;
-                break;
-            case 'clientes_no_rentables':
-                sql = `SELECT Cliente, Razon_Social, SUM(importe - CMV) AS rentabilidad FROM ventas_detalle ${filtroFecha ? 'WHERE ' + filtroFecha : ''} GROUP BY Cliente, Razon_Social HAVING SUM(importe - CMV) <= 0 ORDER BY rentabilidad ${orden} LIMIT ${limite};`;
-                break;
-            case 'clientes_dto_arriba_stnd':
-                sql = `SELECT Cliente, Razon_Social, (SUM(d1) / NULLIF(SUM(importe), 0)) * 100 AS pct_descuento_otorgado FROM ventas_detalle ${filtroFecha ? 'WHERE ' + filtroFecha : ''} GROUP BY Cliente, Razon_Social HAVING (SUM(d1) / NULLIF(SUM(importe), 0)) > 0.05 ORDER BY pct_descuento_otorgado ${orden} LIMIT ${limite};`;
-                break;
-            case 'clientes_no_compran_marca':
-                if (!inputData.marca) return { error: 'Falta el parámetro marca' };
-                params.push(inputData.marca);
-                sql = `SELECT DISTINCT Cliente, Razon_Social FROM ventas_detalle WHERE Cliente NOT IN (SELECT Cliente FROM ventas_detalle WHERE linea = $${params.length}) ${filtroFecha ? 'AND ' + filtroFecha : ''} LIMIT ${limite};`;
-                break;
-            case 'productos_no_rentables':
-                sql = `SELECT Art, articulo, SUM(importe - CMV) AS rentabilidad FROM ventas_detalle ${filtroFecha ? 'WHERE ' + filtroFecha : ''} GROUP BY Art, articulo HAVING SUM(importe - CMV) <= 0 ORDER BY rentabilidad ${orden} LIMIT ${limite};`;
-                break;
-            case 'aumentar_margen_sin_caida_ventas':
-                sql = `SELECT Art, articulo, SUM(Cantidad) AS volumen_unidades, (SUM(importe - CMV) / NULLIF(SUM(importe), 0)) * 100 AS margen_porcentual FROM ventas_detalle ${filtroFecha ? 'WHERE ' + filtroFecha : ''} GROUP BY Art, articulo HAVING SUM(Cantidad) > 1000 AND (SUM(importe - CMV) / NULLIF(SUM(importe), 0)) < 0.15 ORDER BY volumen_unidades ${orden} LIMIT ${limite};`;
-                break;
-            case 'clientes_campeones':
-                sql = `SELECT Cliente, Razon_Social, COUNT(DISTINCT Comprobante) AS frecuencia_compras, SUM(importe) AS valor_monetario, SUM(importe - CMV) AS rentabilidad_actual FROM ventas_detalle ${filtroFecha ? 'WHERE ' + filtroFecha : ''} GROUP BY Cliente, Razon_Social ORDER BY frecuencia_compras ${orden}, valor_monetario ${orden} LIMIT ${limite};`;
-                break;
-            case 'potencial_venta_zonas':
-                sql = `SELECT reparto AS zona, COUNT(DISTINCT Cliente) AS clientes_activos, SUM(importe) AS venta_total_zona, SUM(importe - CMV) AS rentabilidad_zona FROM ventas_detalle WHERE reparto IS NOT NULL ${filtroFecha ? 'AND ' + filtroFecha : ''} GROUP BY reparto ORDER BY venta_total_zona ${orden} LIMIT ${limite};`;
-                break;
-            case 'venta_total':
-                sql = `SELECT SUM(importe) AS venta_bruta, SUM(importe) AS venta_facturada FROM ventas_detalle ${filtroFecha ? 'WHERE ' + filtroFecha : ''};`;
-                break;
-            case 'venta_por_vendedor':
-                sql = `SELECT cod_ven, SUM(importe) AS venta_facturada FROM ventas_detalle ${filtroFecha ? 'WHERE ' + filtroFecha : ''} GROUP BY cod_ven ORDER BY venta_facturada ${orden} LIMIT ${limite};`;
-                break;
-            case 'venta_por_categoria':
-                sql = `SELECT rubro, SUM(importe) AS venta_facturada FROM ventas_detalle ${filtroFecha ? 'WHERE ' + filtroFecha : ''} GROUP BY rubro ORDER BY venta_facturada ${orden} LIMIT ${limite};`;
-                break;
-            case 'clientes_compradores':
-                sql = `SELECT COUNT(DISTINCT Cliente) AS clientes_compradores_unicos FROM ventas_detalle ${filtroFecha ? 'WHERE ' + filtroFecha : ''};`;
-                break;
-            case 'venta_marcas_foco':
-                if (inputData.marcasFoco && inputData.marcasFoco.length > 0) {
-                    params.push(inputData.marcasFoco);
-                    sql = `SELECT linea AS marca_foco, SUM(importe) AS venta_facturada FROM ventas_detalle WHERE linea = ANY($${params.length}) ${filtroFecha ? 'AND ' + filtroFecha : ''} GROUP BY linea ORDER BY venta_facturada ${orden} LIMIT ${limite};`;
-                } else {
-                    // Si no hay marcas foco, traemos las marcas líderes en ventas
-                    sql = `SELECT linea AS marca_foco, SUM(importe) AS venta_facturada FROM ventas_detalle ${filtroFecha ? 'WHERE ' + filtroFecha : ''} GROUP BY linea ORDER BY venta_facturada ${orden} LIMIT ${limite};`;
-                }
-                break;
-            case 'rechazos_devoluciones':
-                sql = `SELECT motivodev AS motivo_rechazo, COUNT(DISTINCT Comprobante) AS cantidad_facturas_rechazadas, SUM(importe) AS valor_rechazado FROM ventas_detalle WHERE motivodev IS NOT NULL AND motivodev NOT IN ('', '0') ${filtroFecha ? 'AND ' + filtroFecha : ''} GROUP BY motivodev ORDER BY cantidad_facturas_rechazadas ${orden} LIMIT ${limite};`;
-                break;
-            case 'inversion_dtos':
-                sql = `SELECT SUM(d1) AS inversion_total_descuentos FROM ventas_detalle ${filtroFecha ? 'WHERE ' + filtroFecha : ''};`;
-                break;
-            case 'pct_venta_sin_dto':
-                sql = `SELECT (SUM(CASE WHEN d1 = 0 OR d1 IS NULL THEN importe ELSE 0 END) / NULLIF(SUM(importe), 0)) * 100 AS pct_ventas_sin_descuento FROM ventas_detalle ${filtroFecha ? 'WHERE ' + filtroFecha : ''};`;
-                break;
-            case 'margen_por_articulo':
-                sql = `SELECT Art, articulo, SUM(importe - CMV) AS margen_dolares, (SUM(importe - CMV) / NULLIF(SUM(importe), 0)) * 100 AS margen_porcentual FROM ventas_detalle ${filtroFecha ? 'WHERE ' + filtroFecha : ''} GROUP BY Art, articulo ORDER BY margen_dolares ${orden} LIMIT ${limite};`;
-                break;
-            case 'margen_total':
-                sql = `SELECT SUM(importe - CMV) AS margen_total_dolares, (SUM(importe - CMV) / NULLIF(SUM(importe), 0)) * 100 AS margen_total_porcentual FROM ventas_detalle ${filtroFecha ? 'WHERE ' + filtroFecha : ''};`;
-                break;
-            case 'margen_descuentos_por_proveedor':
-                sql = `SELECT linea AS proveedor_proxy, SUM(d1) AS total_descuentos_otorgados, SUM(importe - CMV) AS margen_aportado FROM ventas_detalle ${filtroFecha ? 'WHERE ' + filtroFecha : ''} GROUP BY linea ORDER BY margen_aportado ${orden} LIMIT ${limite};`;
-                break;
-            case 'rentabilidad_volumen_subcanal':
-                sql = `SELECT subcanal, SUM(importe) AS ingresos_netos, SUM(cmv) AS costo_mercaderia, (SUM(importe) - SUM(cmv)) AS rentabilidad_bruta, ROUND(( (SUM(importe) - SUM(cmv)) / NULLIF(SUM(importe), 0) * 100 )::numeric, 2) AS margen_porcentual, SUM(peso) AS total_kilos_vendidos FROM ventas_detalle WHERE importe > 0 ${filtroFecha ? 'AND ' + filtroFecha : ''} GROUP BY subcanal ORDER BY rentabilidad_bruta ${orden} LIMIT ${limite};`;
-                break;
-            case 'ticket_promedio_subcanal':
-                sql = `SELECT subcanal, COUNT(DISTINCT comprobante) AS cantidad_facturas_emitidas, SUM(importe) AS importe_total, ROUND(( SUM(importe) / NULLIF(COUNT(DISTINCT comprobante), 0) )::numeric, 2) AS ticket_promedio_pesos FROM ventas_detalle WHERE importe > 0 ${filtroFecha ? 'AND ' + filtroFecha : ''} GROUP BY subcanal ORDER BY ticket_promedio_pesos ${orden} LIMIT ${limite};`;
-                break;
-            case 'ticket_promedio_cliente':
-                sql = `SELECT cliente AS cod_cliente, razon_social, subcanal, COUNT(DISTINCT comprobante) AS cantidad_compras, SUM(importe) AS importe_total, ROUND(( SUM(importe) / NULLIF(COUNT(DISTINCT comprobante), 0) )::numeric, 2) AS ticket_promedio_pesos FROM ventas_detalle WHERE importe > 0 ${filtroFecha ? 'AND ' + filtroFecha : ''} GROUP BY cliente, razon_social, subcanal HAVING COUNT(DISTINCT comprobante) > 1 ORDER BY ticket_promedio_pesos ${orden} LIMIT ${limite};`;
-                break;
-            case 'producto_mas_vendido':
-                sql = `
-                    SELECT 
-                        Art, 
-                        articulo, 
-                        SUM(Cantidad) AS volumen_unidades,
-                        SUM(importe) AS venta_total
-                    FROM ventas_detalle 
-                    ${filtroFecha ? 'WHERE ' + filtroFecha : ''}
-                    GROUP BY Art, articulo 
-                    ORDER BY volumen_unidades ${orden} 
-                    LIMIT ${limite};
-                `;
-                break;
-            case 'evolucion_precio_promedio':
-                sql = `
-                    SELECT 
-                        Art, 
-                        articulo, 
-                        SUM(importe) AS venta_total, 
-                        SUM(Cantidad) AS unidades_vendidas,
-                        (SUM(importe) / NULLIF(SUM(Cantidad), 0)) AS precio_promedio
-                    FROM ventas_detalle
-                    ${filtroFecha ? 'WHERE ' + filtroFecha : ''}
-                    GROUP BY Art, articulo
-                    ORDER BY precio_promedio ${orden}
-                    LIMIT ${limite};
-                `;
-                break;
-            case 'indice_concentracion_pareto':
-                sql = `
-                    SELECT 
-                        Cliente, 
-                        Razon_Social, 
-                        SUM(importe) AS venta_cliente,
-                        (SUM(importe) / NULLIF((SELECT SUM(importe) FROM ventas_detalle ${filtroFecha ? 'WHERE ' + filtroFecha : ''}), 0)) * 100 AS porcentaje_del_total_empresa
-                    FROM ventas_detalle
-                    ${filtroFecha ? 'WHERE ' + filtroFecha : ''}
-                    GROUP BY Cliente, Razon_Social
-                    ORDER BY venta_cliente DESC
-                    LIMIT ${limite};
-                `;
-                break;
-            case 'cumplimiento_mix_ideal':
-                sql = `
-                    SELECT 
-                        linea AS categoria, 
-                        SUM(importe) AS venta_total,
-                        (SUM(importe) / NULLIF((SELECT SUM(importe) FROM ventas_detalle ${filtroFecha ? 'WHERE ' + filtroFecha : ''}), 0)) * 100 AS peso_en_el_mix,
-                        (SUM(importe - CMV) / NULLIF(SUM(importe), 0)) * 100 AS margen_porcentual
-                    FROM ventas_detalle
-                    ${filtroFecha ? 'WHERE ' + filtroFecha : ''}
-                    GROUP BY linea
-                    ORDER BY peso_en_el_mix ${orden}
-                    LIMIT ${limite};
-                `;
-                break;
-            case 'evolucion_diaria_ventas':
-            sql = `
-                SELECT 
-                    to_char(fecha, 'DD/MM/YYYY') AS fecha_formateada, 
-                    SUM(importe) AS venta_neta, 
-                    SUM(importe - cmv) AS rentabilidad_bruta, 
-                    ROUND(( (SUM(importe) - SUM(cmv)) / NULLIF(SUM(importe), 0) * 100 )::numeric, 2) AS margen_porcentual 
-                FROM ventas_detalle 
-                WHERE importe > 0 
-                ${filtroFecha ? 'AND ' + filtroFecha : ''} 
-                GROUP BY fecha 
-                ORDER BY fecha ASC 
-                LIMIT ${limite};
-            `;
-                break;
-            case 'evolucion_mensual_ventas':
-            sql = `
-                SELECT 
-                    TO_CHAR(fecha, 'YYYY-MM') AS mes, 
-                    SUM(importe) AS venta_neta, 
-                    SUM(importe - cmv) AS rentabilidad_bruta, 
-                    ROUND(( (SUM(importe) - SUM(cmv)) / NULLIF(SUM(importe), 0) * 100 )::numeric, 2) AS margen_porcentual 
-                FROM ventas_detalle 
-                WHERE importe > 0 
-                ${filtroFecha ? 'AND ' + filtroFecha : ''} 
-                GROUP BY TO_CHAR(fecha, 'YYYY-MM') 
-                ORDER BY mes ASC 
-                LIMIT ${limite};
-            `;
-            break;
-            case 'ganancia_por_categoria':
-            sql = `
-                SELECT 
-                    linea AS categoria, 
-                    SUM(facturacion) AS venta_neta, 
-                    SUM(facturacion - cmv) AS ganancia_dinero,
-                    ROUND(((SUM(facturacion - cmv) / NULLIF(SUM(facturacion), 0)) * 100)::numeric, 2) AS margen_porcentual
-                FROM ventas_detalle 
-                WHERE facturacion > 0 
-                ${filtroFecha ? 'AND ' + filtroFecha : ''} 
-                GROUP BY linea 
-                ORDER BY ganancia_dinero DESC 
-                LIMIT ${limite};
-            `;
-            break;
-            default:
-                return { error: 'Indicador no reconocido' };
-        }
-
-        console.log(`Ejecutando consulta para: ${inputData.indicador}`);
-
-        try {
-            const res = await pool.query(sql, params);
-            return res.rows;
-        } catch (error: any) {
-            console.error(error);
-            return { error: `Error ejecutando consulta: ${error.message}` };
-        }
-    }
-});
-
