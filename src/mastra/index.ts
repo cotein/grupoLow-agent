@@ -9,23 +9,6 @@ const DEMO_RESOURCE_ID = "DEMO_USER_FINANCIERO_COTO";
 const DEMO_THREAD_ID = "DEMO_THREAD_ESTRATEGICO_001";
 
 export const mastra = new Mastra({
-  server: {
-    middleware: [
-      async (c, next) => {
-        // Reemplaza '*' por el dominio de tu Nuxt en producción para mayor seguridad
-        c.res.headers.set('Access-Control-Allow-Origin', '*'); 
-        c.res.headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-        c.res.headers.set('Access-Control-Allow-Headers', 'Content-Type');
-        
-        // Responder a la solicitud "preflight" del navegador
-        if (c.req.method === 'OPTIONS') {
-          return new Response(null, { status: 204 });
-        }
-        
-        await next();
-      },
-    ],
-  },
   workflows: {},
   agents: { financialAnalystAgent },
   scorers: {},
@@ -54,6 +37,22 @@ export const mastra = new Mastra({
     },
   }),
   server:{
+    port: 4111,
+    middleware: [
+      async (c, next) => {
+        // Reemplaza '*' por el dominio de tu Nuxt en producción para mayor seguridad
+        c.res.headers.set('Access-Control-Allow-Origin', '*'); 
+        c.res.headers.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        c.res.headers.set('Access-Control-Allow-Headers', 'Content-Type');
+        
+        // Responder a la solicitud "preflight" del navegador
+        if (c.req.method === 'OPTIONS') {
+          return new Response(null, { status: 204 });
+        }
+        
+        await next();
+      },
+    ],
     apiRoutes: [
       registerApiRoute('/test', {
         method: 'POST',
