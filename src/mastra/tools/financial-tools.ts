@@ -330,7 +330,18 @@ export const getSalesOpportunities = createTool({
             return res.rows;
         } catch (error) {
             console.error("ERROR EN getSalesOpportunities:", error);
-            throw new Error("Error al ejecutar el análisis de oportunidades de venta.");
+            /**
+             * ESTRATEGIA SENIOR: 
+             * En lugar de 'throw', devolvemos un objeto de error estructurado.
+             * Esto permite que el Agente le diga al usuario: "Hubo un problema con la DB, verifica el formato de fecha".
+             */
+            
+            return {
+                status: "error",
+                message: "No pude completar el análisis de oportunidades.",
+                technical_details: error,
+                suggestion: "Por favor, verifica que las fechas tengan el formato YYYY-MM-DD y que la base de datos esté accesible."
+            };
         }
     }
 });
