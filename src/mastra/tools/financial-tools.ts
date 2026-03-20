@@ -239,47 +239,45 @@ export const getProfitabilityAnalysis = createTool({
 
 export const getSalesOpportunities = createTool({
     id: 'getSalesOpportunities',
-    description: 'Identifica oportunidades de venta analizando qué líneas de productos NO están comprando los clientes top en un periodo dado.',
+    description: 'Detecta brechas de venta comparando la matriz ideal de productos contra ventas reales.',
     inputSchema: z.object({
-        groupBy: z.enum(['vendedor', 'cliente', 'linea', 'subcanal', 'fecha']).default('cliente'),
-        startDate: z.string()
-    .describe("Fecha de inicio del análisis en formato ISO (YYYY-MM-DD). Ejemplo: '2024-01-01'"),
-    
-  endDate: z.string()
-    .describe("Fecha de fin del análisis en formato ISO (YYYY-MM-DD). Debe ser igual o posterior a startDate"),
-        limitTop: z.number().default(50).describe('Cantidad de clientes más grandes a auditar'),
-        recentMonths: z.number().default(4).describe('Meses hacia atrás para verificar si hubo ventas reales')
+        startDate: z.string().optional(),
+        endDate: z.string().optional(),
+        groupBy: z.string().optional(),
+        limit: z.number().optional().default(20)
     }),
-    execute: async ({ groupBy, startDate, endDate, limitTop, recentMonths }) => {
-        // 1. Mapeo de columnas y filtros de fecha siguiendo tu patrón
-        const col = COLUMN_MAPPER[groupBy] || 'razon_social';
-        const { params, querySnippet } = getFechaFilters(startDate, endDate);
-        
-        // Añadimos parámetros adicionales para el LIMIT y el intervalo de ventas recientes
-        params.push(limitTop);
-        const limitParamIndex = params.length;
-        
-        params.push(`${recentMonths} months`);
-        const intervalParamIndex = params.length;
+    // USANDO LA FIRMA QUE TU COMPILADOR PIDE:
+    execute: async ({ groupBy, startDate, endDate, limit }) => {
+        const col = COLUMN_MAPPER[groupBy || 'vendedor'] || 'cod_ven';
+        const params: any[] = [];
+        let querySnippet = '';
 
-        /**
-         * SQL EXPLAINED:
-         * - ClientesTop: Filtra el universo de clientes grandes según facturación en el rango de fechas.
-         * - LineasDisponibles: Obtiene el catálogo activo de líneas.
-         * - MatrizIdeal: Cross Join para crear la expectativa de "Todo cliente debe comprar toda línea".
-         * - VentasReales: Cruza con la realidad de los últimos N meses.
-         */
+        // 1. Construcción de parámetros para el WHERE
+        if (startDate) {
+            params.push(startDate);
+            querySnippet += ` AND fecha >= $${params.length}`;
+        }
+        if (endDate) {
+            params.push(endDate);
+            querySnippet += ` AND fecha <= $${params.length}`;
+        }
+
+        const limitVal = limit || 20;
+        params.push(limitVal);
+        const limitIdx = params.length;
+
+        // RECUPERANDO TU QUERY ORIGINAL COMPLETA
         const query = `
             WITH ClientesTop AS (
                 SELECT 
-                    cliente, 
+                    razon_social as cliente, 
                     ${col} as dimension_nombre,
                     SUM(facturacion) as total_comprado
                 FROM public.ventas_detalle
                 WHERE ${col} IS NOT NULL ${querySnippet}
-                GROUP BY cliente, ${col}
+                GROUP BY razon_social, ${col}
                 ORDER BY total_comprado DESC
-                LIMIT $${limitParamIndex}
+                LIMIT $${limitIdx}
             ),
             LineasDisponibles AS (
                 SELECT DISTINCT linea 
@@ -292,56 +290,33 @@ export const getSalesOpportunities = createTool({
                 CROSS JOIN LineasDisponibles l
             ),
             VentasReales AS (
-                SELECT DISTINCT cliente, linea
+                SELECT DISTINCT razon_social as cliente, linea
                 FROM public.ventas_detalle
-                WHERE 1=1 ${querySnippet ? querySnippet : `AND fecha >= CURRENT_DATE - CAST($${intervalParamIndex} AS INTERVAL)`}
+                WHERE 1=1 ${querySnippet}
             )
             SELECT 
                 m.dimension_nombre as entidad,
+                m.cliente,
                 m.linea as marca_ausente,
                 'Oportunidad de Venta' as accion_sugerida,
-                (CASE WHEN ${startDate ? 'true' : 'false'} OR ${endDate ? 'true' : 'false'} 
-                      THEN 'Sin compras entre ${startDate || '(inicio)'} y ${endDate || '(fin)'}'
-                      ELSE 'Sin compras entre ${startDate || '(inicio)'} y ${endDate || '(fin)'}' 
-                 END) as observacion
+                'Sin compras detectadas en el periodo' as observacion
             FROM MatrizIdeal m
             LEFT JOIN VentasReales v ON m.cliente = v.cliente AND m.linea = v.linea
             WHERE v.linea IS NULL
             ORDER BY m.dimension_nombre ASC, m.linea ASC;
         `;
 
-        // DEBUG siguiendo tu estándar
-        console.log("--- AGENT OPPORTUNITY QUERY START ---");
-        console.log("SQL:", query);
-        console.log("PARAMS:", params);
-        console.log("--- AGENT OPPORTUNITY QUERY END ---");
-
         try {
             const res = await pool.query(query, params);
-
-            if (res.rows.length === 0) {
-                return { message: "No se detectaron brechas de venta. Todos los clientes top están comprando todas las líneas." };
-            }
-
-            console.log("--- AGENT RESPONSE START ---");
-            console.log(`Detectadas ${res.rows.length} oportunidades.`);
-            console.log("--- AGENT RESPONSE END ---");
-
             return res.rows;
-        } catch (error) {
-            console.error("ERROR EN getSalesOpportunities:", error);
-            /**
-             * ESTRATEGIA SENIOR: 
-             * En lugar de 'throw', devolvemos un objeto de error estructurado.
-             * Esto permite que el Agente le diga al usuario: "Hubo un problema con la DB, verifica el formato de fecha".
-             */
-            
-            return {
-                status: "error",
-                message: "No pude completar el análisis de oportunidades.",
-                technical_details: error,
-                suggestion: "Por favor, verifica que las fechas tengan el formato YYYY-MM-DD y que la base de datos esté accesible."
-            };
+        } catch (error: any) {
+            // Manejo de error para evitar el crash del servidor
+            console.error("SQL Error en getSalesOpportunities:", error.message);
+            return [{ 
+                error: "Error en base de datos", 
+                detail: error.message,
+                suggestion: "Revisar conexión o parámetros de fecha"
+            }];
         }
     }
 });
