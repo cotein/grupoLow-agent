@@ -179,51 +179,41 @@ export const getProfitabilityAnalysis = createTool({
         params.push(limit);
 
         const query = `
-            SELECT 
-    ${col} as dimension,
-    
-    -- 1. Ventas Brutas
-    COALESCE(SUM(facturacion) FILTER (WHERE importe > 0), 0) as ventas_brutas,
-    
-    -- 2. Deducciones
-    COALESCE(SUM(d1), 0) as descuentos_totales,
-    
-    -- 3. Ventas Netas
-    COALESCE(SUM(facturacion) FILTER (WHERE importe > 0), 0) - COALESCE(SUM(d1), 0) as ventas_netas,
-    
-    -- 4. Costo de Ventas (CMV de ventas comerciales)
-    COALESCE(SUM(cmv) FILTER (WHERE importe > 0), 0) as costo_de_ventas,
-    
-    -- 5. Utilidad Bruta (Ventas Netas - Costo de Ventas)
-    (COALESCE(SUM(facturacion) FILTER (WHERE importe > 0), 0) - COALESCE(SUM(d1), 0) - COALESCE(SUM(cmv) FILTER (WHERE importe > 0), 0)) as utilidad_bruta,
-    
-    -- 6. Otros Costos (Muestras, etc)
-    COALESCE(SUM(cmv) FILTER (WHERE importe = 0), 0) as costo_muestras,
-    
-    -- 7. RENTABILIDAD REAL (Utilidad Bruta - Otros Costos)
-    (
-        COALESCE(SUM(facturacion) FILTER (WHERE importe > 0), 0) - 
-        COALESCE(SUM(d1), 0) - 
-        COALESCE(SUM(cmv) FILTER (WHERE importe > 0), 0) - 
-        COALESCE(SUM(cmv) FILTER (WHERE importe = 0), 0)
-    ) as rentabilidad_real_neta,
-    
-    -- 8. Márgenes
-    ROUND((
-        (COALESCE(SUM(facturacion) FILTER (WHERE importe > 0), 0) - COALESCE(SUM(d1), 0) - COALESCE(SUM(cmv) FILTER (WHERE importe > 0), 0)) / 
-        NULLIF(COALESCE(SUM(facturacion) FILTER (WHERE importe > 0), 0) - COALESCE(SUM(d1), 0), 0) * 100
-    )::numeric, 2) as margen_bruto_pct,
-    
-    ROUND((
-        (COALESCE(SUM(facturacion) FILTER (WHERE importe > 0), 0) - COALESCE(SUM(d1), 0) - COALESCE(SUM(cmv) FILTER (WHERE importe > 0), 0) - COALESCE(SUM(cmv) FILTER (WHERE importe = 0), 0)) / 
-        NULLIF(COALESCE(SUM(facturacion) FILTER (WHERE importe > 0), 0) - COALESCE(SUM(d1), 0), 0) * 100
-    )::numeric, 2) as margen_real_pct
+            WITH RawData AS (
+    SELECT 
+        ${col} as dimension,
+        
+        -- Sumamos primero los componentes básicos usando COALESCE para evitar NULLs
+        COALESCE(SUM(facturacion) FILTER (WHERE importe > 0), 0) as v_brutas,
+        COALESCE(SUM(d1), 0) as d_totales,
+        COALESCE(SUM(cmv) FILTER (WHERE importe > 0), 0) as c_ventas,
+        COALESCE(SUM(cmv) FILTER (WHERE importe = 0), 0) as c_muestras
 
-FROM ventas_detalle
-WHERE ${col} IS NOT NULL ${querySnippet}
-GROUP BY ${col}
-ORDER BY rentabilidad_real_neta DESC
-LIMIT $${params.length}
+    FROM ventas_detalle
+    WHERE ${col} IS NOT NULL ${querySnippet}
+    GROUP BY ${col}
+)
+, RankedData AS (
+    SELECT 
+        dimension,
+        v_brutas as ventas_brutas,
+        d_totales as descuentos_totales,
+        (v_brutas - d_totales) as ventas_netas,
+        c_ventas as costo_de_ventas,
+        (v_brutas - d_totales - c_ventas) as utilidad_bruta,
+        c_muestras as costo_muestras,
+        (v_brutas - d_totales - c_ventas - c_muestras) as rentabilidad_real_neta
+    FROM RawData
+    ORDER BY (v_brutas - d_totales - c_ventas - c_muestras) DESC
+    LIMIT $${params.length}
+)
+SELECT 
+    *,
+    -- Calculamos los porcentajes solo sobre el set final de datos para total precisión
+    ROUND((utilidad_bruta / NULLIF(ventas_netas, 0) * 100)::numeric, 2) as margen_bruto_pct,
+    ROUND((rentabilidad_real_neta / NULLIF(ventas_netas, 0) * 100)::numeric, 2) as margen_real_pct
+FROM RankedData
+ORDER BY rentabilidad_real_neta DESC;
         `;
 
 
