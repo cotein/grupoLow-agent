@@ -6,7 +6,7 @@ import { instructions } from '../prompts/financial-prompt';
 import { Memory } from "@mastra/memory";
 import { PostgresStore } from '@mastra/pg';
 import { z } from 'zod';
-import { getHealthMetrics, getCustomerAnalytics, getProfitabilityAnalysis, getSalesOpportunities } from '../tools/financial-tools';
+import { getHealthMetrics, getCustomerAnalytics, getProfitabilityAnalysis, getSalesOpportunities, getSellerPerformance } from '../tools/financial-tools';
 
 
 // 1. Create the vector query tool to search the PDF embeddings
@@ -67,7 +67,8 @@ export const financialAnalystAgent = new Agent({
     getCustomerAnalytics,
     getProfitabilityAnalysis,
     pdfVectorQueryTool,
-    getSalesOpportunities
+    getSalesOpportunities,
+    getSellerPerformance
   },
   memory: new Memory({
     storage: new PostgresStore({

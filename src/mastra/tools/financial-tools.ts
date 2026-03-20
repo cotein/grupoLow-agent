@@ -320,3 +320,56 @@ export const getSalesOpportunities = createTool({
         }
     }
 });
+
+/**
+ * TOOL 5: Performance Comercial por Vendedor
+ */
+export const getSellerPerformance = createTool({
+    id: 'getSellerPerformance',
+    description: 'Analiza el performance comercial por vendedor: operaciones, unidades, venta neta, descuentos y ticket promedio.',
+    inputSchema: z.object({
+        startDate: z.string()
+            .describe("Fecha de inicio del análisis en formato ISO (YYYY-MM-DD). Ejemplo: '2024-01-01'"),
+        endDate: z.string()
+            .describe("Fecha de fin del análisis en formato ISO (YYYY-MM-DD). Debe ser igual o posterior a startDate"),
+        limit: z.number().optional().default(20)
+            .describe("Cantidad máxima de vendedores a mostrar (default: 20)")
+    }),
+    execute: async ({ startDate, endDate, limit }) => {
+        const { params, querySnippet } = getFechaFilters(startDate, endDate);
+        
+        const limitVal = limit || 20;
+        params.push(limitVal);
+        const limitIdx = params.length;
+
+        const query = `
+            SELECT 
+                cod_ven AS Codigo_Vendedor,
+                COUNT(DISTINCT comprobante) AS Total_Operaciones,
+                SUM(cantidad) AS Volumen_Unidades,
+                SUM(neto) AS Venta_Neta_Total,
+                SUM(valordesc) AS Total_Descuentos_Aplicados,
+                ROUND(SUM(neto) / NULLIF(COUNT(DISTINCT comprobante), 0), 2) AS Ticket_Promedio
+            FROM 
+                ventas_detalle
+            WHERE 1=1 ${querySnippet}
+            GROUP BY 
+                cod_ven
+            ORDER BY 
+                Venta_Neta_Total DESC
+            LIMIT $${limitIdx};
+        `;
+
+        try {
+            const res = await pool.query(query, params);
+            return res.rows;
+        } catch (error: any) {
+            console.error("SQL Error en getSellerPerformance:", error.message);
+            return [{ 
+                error: "Error en base de datos", 
+                detail: error.message,
+                suggestion: "Revisar conexión o parámetros de fecha"
+            }];
+        }
+    }
+});
