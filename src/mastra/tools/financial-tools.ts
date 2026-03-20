@@ -425,3 +425,54 @@ export const getCategoryPerformance = createTool({
         }
     }
 });
+
+/**
+ * TOOL 7: Oportunidades de Producto por Categoría (Drill-down)
+ */
+export const getCategoryProductOpportunities = createTool({
+    id: 'getCategoryProductOpportunities',
+    description: 'Identifica productos específicos (artículos) que un cliente NO está comprando dentro de una o más categorías (líneas) dadas.',
+    inputSchema: z.object({
+        cliente: z.string().describe('Razón social del cliente (ej: "Autos Norte S.R.L.")'),
+        lineas: z.array(z.string()).describe('Lista de categorías (líneas) a analizar (ej: ["Bebidas", "Snacks"])'),
+        limit: z.number().optional().default(20).describe('Cantidad máxima de productos a mostrar')
+    }),
+    execute: async ({ cliente, lineas, limit }) => {
+        const query = `
+            WITH ArticulosEnLineas AS (
+                SELECT DISTINCT articulo, linea
+                FROM public.ventas_detalle
+                WHERE linea = ANY($1) 
+                  AND articulo IS NOT NULL 
+                  AND articulo != ''
+            ),
+            ArticulosComprados AS (
+                SELECT DISTINCT articulo, linea
+                FROM public.ventas_detalle
+                WHERE razon_social = $2 
+                  AND linea = ANY($1)
+            )
+            SELECT 
+                a.linea as categoria,
+                a.articulo as producto_ausente,
+                'Oportunidad de introducción' as accion_sugerida
+            FROM ArticulosEnLineas a
+            LEFT JOIN ArticulosComprados c ON a.articulo = c.articulo AND a.linea = c.linea
+            WHERE c.articulo IS NULL
+            ORDER BY a.linea ASC, a.articulo ASC
+            LIMIT $3;
+        `;
+
+        try {
+            const res = await pool.query(query, [lineas, cliente, limit]);
+            return res.rows;
+        } catch (error: any) {
+            console.error("SQL Error en getCategoryProductOpportunities:", error.message);
+            return [{ 
+                error: "Error en base de datos", 
+                detail: error.message,
+                suggestion: "Revisar conexión o parámetros"
+            }];
+        }
+    }
+});
