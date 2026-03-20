@@ -180,41 +180,50 @@ export const getProfitabilityAnalysis = createTool({
 
         const query = `
             SELECT 
-                ${col} as dimension,
-                
-                -- 1. Ventas Brutas
-                SUM(facturacion) FILTER (WHERE importe > 0) as ventas_brutas,
-                
-                -- 2. Deducciones
-                SUM(d1) as descuentos_totales,
-                
-                -- 3. Ventas Netas
-                SUM(facturacion) FILTER (WHERE importe > 0) - SUM(d1) as ventas_netas,
-                
-                -- 4. Costo de Ventas (CMV de ventas comerciales)
-                SUM(cmv) FILTER (WHERE importe > 0) as costo_de_ventas,
-                
-                -- 5. Utilidad Bruta (Ventas Netas - Costo de Ventas)
-                SUM(facturacion) FILTER (WHERE importe > 0) - SUM(d1) - SUM(cmv) FILTER (WHERE importe > 0) as utilidad_bruta,
-                
-                -- 6. Otros Costos (Muestras, etc)
-                SUM(cmv) FILTER (WHERE importe = 0) as costo_muestras,
-                
-                -- 7. RENTABILIDAD REAL (Utilidad Bruta - Otros Costos)
-                (SUM(facturacion) FILTER (WHERE importe > 0) - SUM(d1) - SUM(cmv) FILTER (WHERE importe > 0) - SUM(cmv) FILTER (WHERE importe = 0)) as rentabilidad_real_neta,
-                
-                -- 8. Márgenes
-                ROUND(((SUM(facturacion) FILTER (WHERE importe > 0) - SUM(d1) - SUM(cmv) FILTER (WHERE importe > 0)) / 
-                       NULLIF(SUM(facturacion) FILTER (WHERE importe > 0) - SUM(d1), 0) * 100)::numeric, 2) as margen_bruto_pct,
-                
-                ROUND(((SUM(facturacion) FILTER (WHERE importe > 0) - SUM(d1) - SUM(cmv) FILTER (WHERE importe > 0) - SUM(cmv) FILTER (WHERE importe = 0)) / 
-                       NULLIF(SUM(facturacion) FILTER (WHERE importe > 0) - SUM(d1), 0) * 100)::numeric, 2) as margen_real_pct
+    ${col} as dimension,
+    
+    -- 1. Ventas Brutas
+    COALESCE(SUM(facturacion) FILTER (WHERE importe > 0), 0) as ventas_brutas,
+    
+    -- 2. Deducciones
+    COALESCE(SUM(d1), 0) as descuentos_totales,
+    
+    -- 3. Ventas Netas
+    COALESCE(SUM(facturacion) FILTER (WHERE importe > 0), 0) - COALESCE(SUM(d1), 0) as ventas_netas,
+    
+    -- 4. Costo de Ventas (CMV de ventas comerciales)
+    COALESCE(SUM(cmv) FILTER (WHERE importe > 0), 0) as costo_de_ventas,
+    
+    -- 5. Utilidad Bruta (Ventas Netas - Costo de Ventas)
+    (COALESCE(SUM(facturacion) FILTER (WHERE importe > 0), 0) - COALESCE(SUM(d1), 0) - COALESCE(SUM(cmv) FILTER (WHERE importe > 0), 0)) as utilidad_bruta,
+    
+    -- 6. Otros Costos (Muestras, etc)
+    COALESCE(SUM(cmv) FILTER (WHERE importe = 0), 0) as costo_muestras,
+    
+    -- 7. RENTABILIDAD REAL (Utilidad Bruta - Otros Costos)
+    (
+        COALESCE(SUM(facturacion) FILTER (WHERE importe > 0), 0) - 
+        COALESCE(SUM(d1), 0) - 
+        COALESCE(SUM(cmv) FILTER (WHERE importe > 0), 0) - 
+        COALESCE(SUM(cmv) FILTER (WHERE importe = 0), 0)
+    ) as rentabilidad_real_neta,
+    
+    -- 8. Márgenes
+    ROUND((
+        (COALESCE(SUM(facturacion) FILTER (WHERE importe > 0), 0) - COALESCE(SUM(d1), 0) - COALESCE(SUM(cmv) FILTER (WHERE importe > 0), 0)) / 
+        NULLIF(COALESCE(SUM(facturacion) FILTER (WHERE importe > 0), 0) - COALESCE(SUM(d1), 0), 0) * 100
+    )::numeric, 2) as margen_bruto_pct,
+    
+    ROUND((
+        (COALESCE(SUM(facturacion) FILTER (WHERE importe > 0), 0) - COALESCE(SUM(d1), 0) - COALESCE(SUM(cmv) FILTER (WHERE importe > 0), 0) - COALESCE(SUM(cmv) FILTER (WHERE importe = 0), 0)) / 
+        NULLIF(COALESCE(SUM(facturacion) FILTER (WHERE importe > 0), 0) - COALESCE(SUM(d1), 0), 0) * 100
+    )::numeric, 2) as margen_real_pct
 
-            FROM ventas_detalle
-            WHERE ${col} IS NOT NULL ${querySnippet}
-            GROUP BY ${col}
-            ORDER BY rentabilidad_real_neta DESC
-            LIMIT $${params.length}
+FROM ventas_detalle
+WHERE ${col} IS NOT NULL ${querySnippet}
+GROUP BY ${col}
+ORDER BY rentabilidad_real_neta DESC
+LIMIT $${params.length}
         `;
 
 
@@ -365,6 +374,59 @@ export const getSellerPerformance = createTool({
             return res.rows;
         } catch (error: any) {
             console.error("SQL Error en getSellerPerformance:", error.message);
+            return [{ 
+                error: "Error en base de datos", 
+                detail: error.message,
+                suggestion: "Revisar conexión o parámetros de fecha"
+            }];
+        }
+    }
+});
+
+/**
+ * TOOL 6: Performance Comercial por Categoría (Rubro)
+ */
+export const getCategoryPerformance = createTool({
+    id: 'getCategoryPerformance',
+    description: 'Analiza el performance comercial por categoría (rubro): unidades, venta neta, costo y margen de contribución.',
+    inputSchema: z.object({
+        startDate: z.string()
+            .describe("Fecha de inicio del análisis en formato ISO (YYYY-MM-DD). Ejemplo: '2024-01-01'"),
+        endDate: z.string()
+            .describe("Fecha de fin del análisis en formato ISO (YYYY-MM-DD). Debe ser igual o posterior a startDate"),
+        limit: z.number().optional().default(20)
+            .describe("Cantidad máxima de categorías a mostrar (default: 20)")
+    }),
+    execute: async ({ startDate, endDate, limit }) => {
+        const { params, querySnippet } = getFechaFilters(startDate, endDate);
+        
+        const limitVal = limit || 20;
+        params.push(limitVal);
+        const limitIdx = params.length;
+
+        const query = `
+            SELECT 
+                rubro AS Categoria_Producto,
+                SUM(cantidad) AS Unidades_Vendidas,
+                SUM(neto) AS Venta_Neta_Total,
+                SUM(cmv) AS Costo_Total_Ventas,
+                SUM(neto) - SUM(cmv) AS Margen_Contribucion_Pesos,
+                ROUND(((SUM(neto) - SUM(cmv)) / NULLIF(SUM(neto), 0)) * 100, 2) AS Porcentaje_Margen
+            FROM 
+                ventas_detalle
+            WHERE 1=1 ${querySnippet}
+            GROUP BY 
+                rubro
+            ORDER BY 
+                Venta_Neta_Total DESC
+            LIMIT $${limitIdx};
+        `;
+
+        try {
+            const res = await pool.query(query, params);
+            return res.rows;
+        } catch (error: any) {
+            console.error("SQL Error en getCategoryPerformance:", error.message);
             return [{ 
                 error: "Error en base de datos", 
                 detail: error.message,
